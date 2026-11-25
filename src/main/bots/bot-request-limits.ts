@@ -84,7 +84,7 @@ function refuseOverChainLimit(
 }
 
 /** The quota a send takes in its admission, refusing the send past it; only a bot's send has one. */
-export function botPairLimitOf(
+function botPairLimitOf(
   sending: Sending,
   target: Pick<Bot, 'name'>,
   sendKey: string | undefined
@@ -156,16 +156,31 @@ function holdPairPlace(
   }
 }
 
-/** Refuses a send past its chain's hand-offs, then holds its place in the pair's quota. */
+/** Runs a send with what it holds under the limits, each released once the send settles. */
+export async function holdingUntilSettled<T>(
+  send: (held: (() => void)[]) => Promise<T>
+): Promise<T> {
+  const held: (() => void)[] = []
+  try {
+    return await send(held)
+  } finally {
+    held.forEach((release) => release())
+  }
+}
+
+/** Refuses a send past its chain's hand-offs, then holds its place in the pair's quota until it
+ *  settles (`held`); returns the quota its stored request is taken under. */
 export function holdUnderLimits(
   db: OrchestrationDb,
   sending: Sending,
   target: Pick<Bot, 'id' | 'name'>,
   depth: number,
-  send: { sendKey?: string; messageId: string }
-): () => void {
+  send: { sendKey?: string; messageId: string },
+  held: (() => void)[]
+): BotRequestPairLimit | undefined {
   refuseOverChainLimit(sending, target, depth, send.sendKey)
-  return holdPairPlace(db, sending, target, send)
+  held.push(holdPairPlace(db, sending, target, send))
+  return botPairLimitOf(sending, target, send.sendKey)
 }
 
 /** Tells the owner in the sending chat, once per refused send (a group's room shows nothing),

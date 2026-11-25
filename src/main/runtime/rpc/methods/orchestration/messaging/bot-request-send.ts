@@ -139,21 +139,19 @@ type SendBotRequestArgs = {
 async function sendBotRequest(args: SendBotRequestArgs): Promise<unknown> {
   const asked = askedInConversation(args.runtime, args.acting)
   const card = ownerChatCard(args.acting, args.receiving, args.params, asked)
-  // What the send holds until it settles: its place in the pair's quota.
-  const settled: (() => void)[] = []
-  return admitBotRequestMail(args, card, asked, settled)
-    .catch((error: unknown) => {
-      card.refused(error)
-      throw error
-    })
-    .finally(() => settled.forEach((release) => release()))
+  try {
+    return await limits.holdingUntilSettled((held) => admitBotRequestMail(args, card, asked, held))
+  } catch (error) {
+    card.refused(error)
+    throw error
+  }
 }
 
 async function admitBotRequestMail(
   args: SendBotRequestArgs,
   card: ReturnType<typeof ownerChatCard>,
   asked: Pick<BotRequestRecord, 'askedInConversation'>,
-  settled: (() => void)[]
+  quota: (() => void)[]
 ): Promise<unknown> {
   const { runtime, db, params, receiving, acting } = args
   const chain = botRequestChain(db, acting.sessionId, acting.turn)
@@ -239,7 +237,6 @@ async function admitBotRequestMail(
   if (blocked) {
     return blockedReceipt(blocked).receipt
   }
-  settled.push(limits.holdUnderLimits(db, acting, target, chain.depth, { ...key, messageId }))
   // The whole payload is Orca's, so the receiving bot never reads the sender's own fields as these.
   const payload = botRequestPayload(record, messageId, args.images)
   const request = {
@@ -247,7 +244,8 @@ async function admitBotRequestMail(
     fromBotId: record.fromBotId,
     depth: record.depth,
     record: JSON.stringify(record),
-    pairLimit: limits.botPairLimitOf(acting, target, key.sendKey)
+    // Its place is held, or the send refused, before any chat is made or shown for it.
+    pairLimit: limits.holdUnderLimits(db, acting, target, chain.depth, { ...key, messageId }, quota)
   }
   /** `reserved`: the request's place is already held, so only its mail is stored. */
   /** `held`: the chat a failed turn holds that this request queues in, named to the sender. */
