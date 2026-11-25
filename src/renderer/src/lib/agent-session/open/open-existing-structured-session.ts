@@ -11,7 +11,10 @@ import type {
   StructuredSessionOpenTab,
   StructuredSessionOpenFailure
 } from '../../../../../shared/agent-session/view/open-structured-agent-session'
-import * as tabActivation from '../structured-agent-session-tab-activation'
+import {
+  findStructuredAgentSessionTab,
+  activateStructuredAgentSessionById
+} from '../structured-agent-session-tab-activation'
 import { useAppStore } from '@/store/index'
 import { runtimeEnvironmentIdOrLocalUnlessTwin } from '../../workspace/ownership/worktree-runtime-owner'
 import { callRuntimeRpc } from '@/runtime/rpc/calls/runtime-rpc-call'
@@ -25,11 +28,7 @@ import { executionHostIdForStructuredTarget } from '@/runtime/native-chat/sessio
 import type { OrchestrationPartyLocationResult } from '../../../../../shared/orchestration/orchestration-caller-status'
 import type { RuntimeClientTarget } from '../../../../../shared/remote-runtime/host-catalog/runtime-client-target'
 
-import {
-  STRUCTURED_SESSION_RESTORE_TIMEOUT_MS,
-  withStructuredSessionRestoreTimeout
-} from './structured-session-restore-timeout'
-import { noteDesktopOpenRequest } from './wait-for-structured-session-tab'
+const STRUCTURED_SESSION_RESTORE_TIMEOUT_MS = 5_000
 
 /** Keep distinct remedies: retry unreachable hosts, stop on a confirmed missing record, or update incompatible hosts/adapters. Failure to answer never proves a chat is gone. */
 export type StructuredSessionRevealOutcome =
@@ -40,7 +39,7 @@ export type StructuredSessionRevealOutcome =
   | 'unreachable'
 
 export type StructuredSessionOpenAdapterDeps = {
-  activate: typeof tabActivation.activateStructuredAgentSessionById
+  activate: typeof activateStructuredAgentSessionById
   tabs: (
     target: { sessionId: string; worktreeId: string },
     owner: RuntimeClientTarget
@@ -54,16 +53,13 @@ export type StructuredSessionOpenAdapterDeps = {
 }
 
 const defaultDeps: StructuredSessionOpenAdapterDeps = {
-  activate: tabActivation.activateStructuredAgentSessionById,
+  activate: activateStructuredAgentSessionById,
   tabs: (target, owner) => {
-    const tab = tabActivation.findStructuredAgentSessionTab(
-      useAppStore.getState().unifiedTabsByWorktree,
-      {
-        workspaceId: target.worktreeId,
-        sessionId: target.sessionId,
-        target: owner
-      }
-    )
+    const tab = findStructuredAgentSessionTab(useAppStore.getState().unifiedTabsByWorktree, {
+      workspaceId: target.worktreeId,
+      sessionId: target.sessionId,
+      target: owner
+    })
     return tab ? [{ id: tab.id, sessionId: tab.entityId, agent: tab.agentSessionAgent }] : []
   },
   refresh: refreshStructuredSessionTabs,
@@ -124,8 +120,6 @@ export async function openDesktopStructuredSessionInteraction(
     source.kind === 'history'
       ? `${executionHostIdForStructuredTarget(owner)}\0${source.structuredSession.workspaceId}\0${source.structuredSession.sessionId}`
       : undefined
-  // Every request counts, a repeat of a pending open included: it renews that open's claim.
-  const request = noteDesktopOpenRequest(key)
   const pending = key === undefined ? undefined : activationsInFlight.get(key)
   if (pending) {
     return pending
@@ -134,13 +128,7 @@ export async function openDesktopStructuredSessionInteraction(
   const execute = async (): Promise<StructuredSessionOpenResult> => {
     initialized = options.initialize?.() !== false
     return initialized
-      ? executeDesktopStructuredSession(
-          source,
-          owner,
-          options.deps ?? defaultDeps,
-          request,
-          options.locate
-        )
+      ? executeDesktopStructuredSession(source, owner, options.deps ?? defaultDeps, options.locate)
       : {
           kind: 'failed' as const,
           failure: { reason: 'unreachable' as const, beforeEffects: true }
@@ -187,7 +175,6 @@ async function executeDesktopStructuredSession(
   source: StructuredSessionOpenSource,
   owner: RuntimeClientTarget,
   deps: StructuredSessionOpenAdapterDeps,
-  request: unknown,
   locate?: StructuredSessionOpenDeps['locate']
 ): Promise<StructuredSessionOpenResult> {
   const party =
@@ -216,7 +203,6 @@ async function executeDesktopStructuredSession(
         .some((row) => row.id === tab.id && row.sessionId === target.sessionId) &&
       deps.activate({ ...target, target: owner }),
     refresh: (target) => deps.refresh(target.worktreeId, owner),
-    ...tabActivation.pairedRevealedTabWait(owner, deps.tabs, request),
     reveal: async (target) => {
       const outcome = await deps.reveal({ ...target, target: owner })
       return typeof outcome === 'object'
@@ -314,4 +300,23 @@ async function refreshStructuredSessionTabs(
       { timeoutMs: STRUCTURED_SESSION_RESTORE_TIMEOUT_MS }
     )
   )
+}
+
+async function withStructuredSessionRestoreTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('structured_session_restore_timeout')),
+          STRUCTURED_SESSION_RESTORE_TIMEOUT_MS
+        )
+      })
+    ])
+  } finally {
+    if (timer) {
+      clearTimeout(timer)
+    }
+  }
 }

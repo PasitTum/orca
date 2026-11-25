@@ -1,13 +1,9 @@
 import { activateAiVaultStructuredSession } from '@/lib/agent-session/open/activate-ai-vault-structured-session'
 import { targetBotChatLatest } from '@/lib/agent-session/open/bot-link-item-target'
-import { botTarget, callBotRpc, type BotOnHost } from '@/lib/bot-hosts'
+import { botTarget, callBotRpc, type BotOnHost, type BotRef } from '@/lib/bot-hosts'
 import { activateAndRevealFolderWorkspaceWithOutcome } from '@/lib/workspace/activation/worktree-activation'
 import { showChatOpenUnavailable } from '@/lib/agent-session/open/chat-open-failure-toast'
-import { desktopSelectionKey } from '@/lib/agent-session/open/paired-revealed-tab-wait'
-import {
-  isLatestDesktopOpenRequest,
-  noteDesktopOpenRequest
-} from '@/lib/agent-session/open/wait-for-structured-session-tab'
+import { watchBotOpenIntent, type BotOpenIntent } from './bot-open-intent'
 import { runtimeTargetEnvironmentId } from '@/runtime/rpc/targets/runtime-client-target'
 import { LOCAL_EXECUTION_HOST_ID } from '../../../../shared/execution-host/execution-host'
 import { selectFocusedChatTab } from '@/lib/focused-chat-workers'
@@ -33,19 +29,20 @@ function admitHome(bot: BotHome): ReturnType<typeof activateAndRevealFolderWorks
 /** A server bot's chat tabs reach this window only through its home's workspace stream, so the
  *  home opens here first, as a Slack link's does. This computer's bots publish their tabs directly.
  *  `notified`: the refusal already told the user why (a blocked folder path). `stale`: the user
- *  opened something else while the home's folder list loaded, so the window stays where they put it. */
+ *  moved to another workspace since asking, so the window stays where they put it. */
 async function admitServerBotHome(
   bot: BotHome,
-  sessionId: string
+  intent: BotOpenIntent
 ): Promise<'opened' | 'refused' | 'notified' | 'stale'> {
+  if (intent.moved()) {
+    return 'stale'
+  }
   if (bot.hostId === LOCAL_EXECUTION_HOST_ID) {
     return 'opened'
   }
   let outcome = admitHome(bot)
   if ('refused' in outcome && outcome.refused.reason === 'workspace-missing') {
     // The home must be in the catalog before it can open; a failed read leaves it refused.
-    const request = noteDesktopOpenRequest(`bot-home\0${bot.hostId}\0${sessionId}`)
-    const shown = desktopSelectionKey()
     try {
       await useAppStore
         .getState()
@@ -53,7 +50,7 @@ async function admitServerBotHome(
     } catch {
       /* Reported below as a home that did not open, with Retry. */
     }
-    if (!isLatestDesktopOpenRequest(request) || desktopSelectionKey() !== shown) {
+    if (intent.moved()) {
       return 'stale'
     }
     outcome = admitHome(bot)
@@ -61,11 +58,20 @@ async function admitServerBotHome(
   return 'opened' in outcome ? 'opened' : outcome.refused.failureNotified ? 'notified' : 'refused'
 }
 
-/** Opens one of the bot's chats as a focused tab, on the host that runs the bot. Retry repeats both
- *  steps for this same chat, so a home that failed to load gets another try and nothing starts anew. */
-export async function openBotChatTab(bot: BotHome, sessionId: string): Promise<boolean> {
+/**
+ * Opens one of the bot's chats as a focused tab, on the host that runs the bot. `intent` starts at the
+ * user's click (a new chat's starts before the host made it); absent, the click is now. Retry is a
+ * new click that repeats both steps for this same chat, so a home that failed to load gets another
+ * try and nothing starts anew.
+ */
+export async function openBotChatTab(
+  bot: BotHome,
+  sessionId: string,
+  intent: BotOpenIntent = watchBotOpenIntent()
+): Promise<boolean> {
   const retry = (): Promise<boolean> => openBotChatTab(bot, sessionId)
-  const home = await admitServerBotHome(bot, sessionId)
+  // The home switch below is this open's own move; nothing past it is watched.
+  const home = await admitServerBotHome(bot, intent).finally(intent.stop)
   if (home !== 'opened') {
     if (home === 'refused') {
       showChatOpenUnavailable({
@@ -83,16 +89,30 @@ export async function openBotChatTab(bot: BotHome, sessionId: string): Promise<b
   )
 }
 
+/** Starts a bot chat on its host from the user's click, then opens it here. A move to another
+ *  workspace while the host starts it keeps the window where the user put it. */
+export function startAndOpenBotChat(
+  bot: BotHome,
+  start: () => Promise<string>,
+  onError: (error: unknown) => void
+): void {
+  const intent = watchBotOpenIntent()
+  void start()
+    .then((sessionId) => openBotChatTab(bot, sessionId, intent))
+    .catch(onError)
+    .finally(intent.stop)
+}
+
 /** Opening a chat without a tab reveals it, which marks its thread seen; activating its open tab here
  *  doesn't, so this says so. An older host has no such method and keeps the thread new. */
-async function markSeen(bot: Bot, sessionIds: string[]): Promise<void> {
+async function markSeen(bot: BotRef, sessionIds: string[]): Promise<void> {
   if (sessionIds.length > 0) {
     await callBotRpc(bot, 'bots.chats.seen', { sessionIds }).catch(() => undefined)
   }
 }
 
 /** The chat's tab when it is the one on screen, where activating it again would change nothing. */
-function shownChatTab(bot: Bot, sessionId: string): { id: string } | null {
+function shownChatTab(bot: BotHome, sessionId: string): { id: string } | null {
   const state = useAppStore.getState()
   const workspaceId = folderWorkspaceKey(bot.folderWorkspaceId)
   if (state.activeView !== 'terminal' || state.activeWorktreeId !== workspaceId) {
@@ -104,7 +124,7 @@ function shownChatTab(bot: Bot, sessionId: string): { id: string } | null {
 
 /** Opens one of the bot's chats as a focused tab; a thread's or a run's gets its tab here. The chat
  *  already on screen goes to its newest output, its composer focused with the usual glow. */
-export function openBotSession(bot: Bot, sessionId: string): void {
+export function openBotSession(bot: BotHome & BotRef, sessionId: string): void {
   const shown = shownChatTab(bot, sessionId)
   if (shown) {
     targetBotChatLatest(sessionId)

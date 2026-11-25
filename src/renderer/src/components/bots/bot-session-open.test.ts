@@ -1,14 +1,48 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({
-  admit: vi.fn(),
-  fetchFolderWorkspaces: vi.fn(),
-  activate: vi.fn(),
-  unavailable: vi.fn(),
-  callBotRpc: vi.fn(),
-  shown: { key: 'workspace-x|tab-1' }
-}))
+const mocks = vi.hoisted(() => {
+  const listeners = new Set<() => void>()
+  const state: {
+    activeView: string
+    activeWorkspaceKey: string | null
+    activeWorktreeId: string | null
+    activeWorkspaceExecutionHostId: string | null
+    fetchFolderWorkspaces: (args: unknown) => Promise<void>
+  } = {
+    activeView: 'terminal',
+    activeWorkspaceKey: 'folder:elsewhere',
+    activeWorktreeId: 'folder:elsewhere',
+    activeWorkspaceExecutionHostId: null,
+    fetchFolderWorkspaces: async () => {}
+  }
+  return {
+    state,
+    listeners,
+    fetchFolderWorkspaces: vi.fn(),
+    admit: vi.fn(),
+    activate: vi.fn(),
+    unavailable: vi.fn(),
+    callBotRpc: vi.fn(),
+    /** The user shows another workspace, as a workspace switch writes the store. */
+    show: (workspace: string): void => {
+      state.activeWorkspaceKey = workspace
+      state.activeWorktreeId = workspace
+      listeners.forEach((listener) => listener())
+    },
+    /** A store write that changes no workspace selection, like a catalog read or a tab frame. */
+    touch: (): void => listeners.forEach((listener) => listener())
+  }
+})
 
+vi.mock('@/store', () => ({
+  useAppStore: {
+    getState: () => mocks.state,
+    subscribe: (listener: () => void) => {
+      mocks.listeners.add(listener)
+      return () => mocks.listeners.delete(listener)
+    }
+  }
+}))
 vi.mock('@/lib/workspace/activation/worktree-activation', () => ({
   activateAndRevealFolderWorkspaceWithOutcome: mocks.admit
 }))
@@ -18,17 +52,14 @@ vi.mock('@/lib/agent-session/open/activate-ai-vault-structured-session', () => (
 vi.mock('@/lib/agent-session/open/chat-open-failure-toast', () => ({
   showChatOpenUnavailable: mocks.unavailable
 }))
-vi.mock('@/lib/agent-session/open/paired-revealed-tab-wait', () => ({
-  desktopSelectionKey: () => mocks.shown.key
-}))
-vi.mock(
-  '@/lib/agent-session/open/wait-for-structured-session-tab',
-  () => import('../../lib/agent-session/open/wait-for-structured-session-tab')
-)
 vi.mock('@/lib/agent-session/open/bot-link-item-target', () => ({ targetBotChatLatest: vi.fn() }))
-vi.mock('@/lib/focused-chat-workers', () => ({ selectFocusedChatTab: vi.fn() }))
+vi.mock('@/lib/focused-chat-workers', () => ({ selectFocusedChatTab: () => null }))
 vi.mock('@/components/native-chat/composer/focus/native-chat-composer-focus-intent', () => ({
   requestNativeChatComposerFocus: vi.fn()
+}))
+vi.mock('@/runtime/rpc/targets/runtime-client-target', () => ({
+  runtimeTargetEnvironmentId: (target: { kind: string; environmentId?: string }) =>
+    target.kind === 'environment' ? target.environmentId : null
 }))
 vi.mock('@/lib/bot-hosts', () => ({
   botTarget: (bot: { hostId: string }) =>
@@ -37,29 +68,50 @@ vi.mock('@/lib/bot-hosts', () => ({
       : { kind: 'environment', environmentId: bot.hostId.replace('runtime:', '') },
   callBotRpc: mocks.callBotRpc
 }))
-vi.mock('@/runtime/rpc/targets/runtime-client-target', () => ({
-  runtimeTargetEnvironmentId: (target: { kind: string; environmentId?: string }) =>
-    target.kind === 'environment' ? target.environmentId : null
-}))
-vi.mock('@/store', () => ({
-  useAppStore: { getState: () => ({ fetchFolderWorkspaces: mocks.fetchFolderWorkspaces }) }
-}))
 
-import { openBotChatTab } from './bot-session-open'
-import { noteDesktopOpenRequest } from '../../lib/agent-session/open/wait-for-structured-session-tab'
+import { openBotChatTab, openBotSession, startAndOpenBotChat } from './bot-session-open'
 
 const opened = { opened: {} }
 const missing = { refused: { reason: 'workspace-missing', failureNotified: false } }
 const blocked = { refused: { reason: 'path-blocked', failureNotified: true } }
+const serverBot = { id: 'bot-1', folderWorkspaceId: 'home-1', hostId: 'runtime:env-1' } as const
+const chatOne = { structuredSession: { sessionId: 'chat-1', workspaceId: 'folder:home-1' } }
 
-const serverBot = { folderWorkspaceId: 'home-1', hostId: 'runtime:env-1' } as const
+/** Host calls that would start or reset a chat; recovery must never make them. */
+function hostStartsOrResets(): unknown[] {
+  return mocks.callBotRpc.mock.calls
+    .map(([, method]) => method)
+    .filter((method) => method === 'bots.session.start' || method === 'bots.chat.reset')
+}
+
+/** A folder-list read that stays pending until `answer` runs, which also lists the Home. */
+function heldFolderList(): { answer: () => void } {
+  let answer = (): void => {}
+  mocks.fetchFolderWorkspaces.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        answer = () => {
+          mocks.admit.mockReturnValue(opened)
+          resolve()
+        }
+      })
+  )
+  return { answer: () => answer() }
+}
+
+function reset(): void {
+  vi.clearAllMocks()
+  mocks.listeners.clear()
+  mocks.state.activeWorkspaceKey = 'folder:elsewhere'
+  mocks.state.activeWorktreeId = 'folder:elsewhere'
+  mocks.state.fetchFolderWorkspaces = mocks.fetchFolderWorkspaces
+  mocks.fetchFolderWorkspaces.mockResolvedValue(undefined)
+  mocks.activate.mockResolvedValue(true)
+  mocks.callBotRpc.mockResolvedValue(undefined)
+}
 
 describe('openBotChatTab', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-    mocks.shown.key = 'workspace-x|tab-1'
-    mocks.activate.mockResolvedValue(true)
-  })
+  beforeEach(reset)
 
   it('opens a server bot Home before the chat, on the bot’s host', async () => {
     mocks.admit.mockReturnValue(opened)
@@ -69,34 +121,30 @@ describe('openBotChatTab', () => {
       revealInSidebar: false
     })
     expect(mocks.activate).toHaveBeenCalledWith(
-      { structuredSession: { sessionId: 'chat-1', workspaceId: 'folder:home-1' } },
+      chatOne,
       undefined,
       { kind: 'environment', environmentId: 'env-1' },
       expect.any(Function)
     )
+    expect(mocks.listeners.size).toBe(0)
   })
 
   it('offers Retry when the Home list failed, and Retry opens the same chat once it loads', async () => {
     mocks.admit.mockReturnValue(missing)
     mocks.fetchFolderWorkspaces.mockRejectedValueOnce(new Error('list failed'))
     await expect(openBotChatTab(serverBot, 'chat-1')).resolves.toBe(false)
-    // The chat open never ran against a Home that is not here.
     expect(mocks.activate).not.toHaveBeenCalled()
     expect(mocks.unavailable).toHaveBeenCalledTimes(1)
     const { retry, detail } = mocks.unavailable.mock.calls[0][0]
     expect(detail).toBe("The bot's home did not open on this computer.")
 
-    // The server's folder list answers now; Retry loads the Home, then opens the same chat.
     mocks.fetchFolderWorkspaces.mockImplementationOnce(async () => {
       mocks.admit.mockReturnValue(opened)
     })
     retry()
     await vi.waitFor(() => expect(mocks.activate).toHaveBeenCalledTimes(1))
-    expect(mocks.activate.mock.calls[0][0]).toEqual({
-      structuredSession: { sessionId: 'chat-1', workspaceId: 'folder:home-1' }
-    })
-    // Recovery never starts or resets a chat on the host.
-    expect(mocks.callBotRpc).not.toHaveBeenCalled()
+    expect(mocks.activate.mock.calls[0][0]).toEqual(chatOne)
+    expect(hostStartsOrResets()).toEqual([])
   })
 
   it('a failed chat open’s Retry repeats the Home step too', async () => {
@@ -110,44 +158,103 @@ describe('openBotChatTab', () => {
     }
     expect(mocks.admit).toHaveBeenCalledTimes(1)
     expect(mocks.activate).toHaveBeenCalledTimes(2)
-    expect(mocks.activate.mock.calls[1][0]).toEqual(mocks.activate.mock.calls[0][0])
+    expect(mocks.activate.mock.calls[1][0]).toEqual(chatOne)
   })
 
-  it('stops without a second notice when the Home refusal already explained itself', async () => {
+  it('a blocked Home path keeps its own notice; the chat row reopens the same chat once the path is back', async () => {
     mocks.admit.mockReturnValue(blocked)
     await expect(openBotChatTab(serverBot, 'chat-1')).resolves.toBe(false)
     expect(mocks.unavailable).not.toHaveBeenCalled()
     expect(mocks.activate).not.toHaveBeenCalled()
+
+    // The folder is back; the user clicks the chat's row in the bot's Chats list.
+    mocks.admit.mockReturnValue(opened)
+    openBotSession(serverBot, 'chat-1')
+    await vi.waitFor(() => expect(mocks.activate).toHaveBeenCalledTimes(1))
+    expect(mocks.activate.mock.calls[0][0]).toEqual(chatOne)
+    expect(hostStartsOrResets()).toEqual([])
   })
 
   it('opens a bot on this computer without a Home step', async () => {
-    const localBot = { ...serverBot, hostId: 'local' } as const
-    await openBotChatTab(localBot, 'chat-1')
+    await openBotChatTab({ ...serverBot, hostId: 'local' }, 'chat-1')
     expect(mocks.admit).not.toHaveBeenCalled()
     expect(mocks.activate).toHaveBeenCalledTimes(1)
   })
 
-  it('leaves the window alone when another open starts while the Home list loads', async () => {
+  it('stays put when the user moves to another workspace while the Home list loads', async () => {
     mocks.admit.mockReturnValue(missing)
-    mocks.fetchFolderWorkspaces.mockImplementationOnce(async () => {
-      noteDesktopOpenRequest('open another chat')
-      mocks.admit.mockReturnValue(opened)
-    })
-    await expect(openBotChatTab(serverBot, 'chat-1')).resolves.toBe(false)
-    // Only the first, refused admission ran: the late list never switches to this Home.
+    const list = heldFolderList()
+    const open = openBotChatTab(serverBot, 'chat-1')
+    mocks.show('folder:other')
+    list.answer()
+    await expect(open).resolves.toBe(false)
     expect(mocks.admit).toHaveBeenCalledTimes(1)
     expect(mocks.activate).not.toHaveBeenCalled()
     expect(mocks.unavailable).not.toHaveBeenCalled()
+    expect(mocks.state.activeWorkspaceKey).toBe('folder:other')
   })
 
-  it('leaves the window alone when the user selects something else while the Home list loads', async () => {
+  it('stays put when the user goes elsewhere and comes back while the Home list loads', async () => {
     mocks.admit.mockReturnValue(missing)
-    mocks.fetchFolderWorkspaces.mockImplementationOnce(async () => {
-      mocks.shown.key = 'workspace-y|tab-2'
-      mocks.admit.mockReturnValue(opened)
-    })
-    await expect(openBotChatTab(serverBot, 'chat-1')).resolves.toBe(false)
+    const list = heldFolderList()
+    const open = openBotChatTab(serverBot, 'chat-1')
+    mocks.show('folder:other')
+    mocks.show('folder:elsewhere')
+    list.answer()
+    await expect(open).resolves.toBe(false)
     expect(mocks.admit).toHaveBeenCalledTimes(1)
+    expect(mocks.activate).not.toHaveBeenCalled()
+  })
+
+  it('still opens when only the catalog changes while the Home list loads', async () => {
+    mocks.admit.mockReturnValue(missing)
+    const list = heldFolderList()
+    const open = openBotChatTab(serverBot, 'chat-1')
+    mocks.touch()
+    list.answer()
+    await expect(open).resolves.toBe(true)
+    expect(mocks.admit).toHaveBeenCalledTimes(2)
+    expect(mocks.activate).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('startAndOpenBotChat', () => {
+  beforeEach(() => {
+    reset()
+    mocks.admit.mockReturnValue(opened)
+  })
+
+  it('opens the started chat when the user stayed where they clicked', async () => {
+    startAndOpenBotChat(serverBot, async () => 'chat-1', vi.fn())
+    await vi.waitFor(() => expect(mocks.activate).toHaveBeenCalledTimes(1))
+    expect(mocks.admit).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(mocks.listeners.size).toBe(0))
+  })
+
+  it('leaves the window where the user moved while the host started the chat', async () => {
+    let started = (_sessionId: string): void => {}
+    startAndOpenBotChat(
+      serverBot,
+      () =>
+        new Promise<string>((resolve) => {
+          started = resolve
+        }),
+      vi.fn()
+    )
+    mocks.show('folder:other')
+    started('chat-1')
+    await vi.waitFor(() => expect(mocks.listeners.size).toBe(0))
+    await Promise.resolve()
+    expect(mocks.admit).not.toHaveBeenCalled()
+    expect(mocks.activate).not.toHaveBeenCalled()
+    expect(mocks.state.activeWorkspaceKey).toBe('folder:other')
+  })
+
+  it('reports a failed start and stops watching', async () => {
+    const onError = vi.fn()
+    startAndOpenBotChat(serverBot, () => Promise.reject(new Error('no agent')), onError)
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(mocks.listeners.size).toBe(0))
     expect(mocks.activate).not.toHaveBeenCalled()
   })
 })

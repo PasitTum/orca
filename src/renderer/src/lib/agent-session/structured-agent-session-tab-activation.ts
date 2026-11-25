@@ -11,8 +11,6 @@ import {
 import { toRuntimeWorktreeSelector } from '@/runtime/rpc/targets/runtime-worktree-selector'
 import type { Tab } from '../../../../shared/workspace-layout/tab-groups/tab-types'
 
-export { pairedRevealedTabWait } from './open/paired-revealed-tab-wait'
-
 export function findStructuredAgentSessionTab(
   unifiedTabsByWorktree: Readonly<Record<string, readonly Tab[]>>,
   args: { workspaceId: string; sessionId: string; target?: RuntimeClientTarget }
