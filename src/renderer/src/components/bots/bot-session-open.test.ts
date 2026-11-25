@@ -142,6 +142,9 @@ describe('openBotChatTab', () => {
       { kind: 'environment', environmentId: 'env-1' },
       expect.any(Function)
     )
+    expect(mocks.admit.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.activate.mock.invocationCallOrder[0]
+    )
     expect(mocks.listeners.size).toBe(0)
   })
 
