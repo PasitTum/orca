@@ -110,6 +110,8 @@ export type StructuredAgentSessionChildClose = {
 /** Written only by structured-agent-session-provider-child. */
 export type StructuredAgentSessionProviderChild = StructuredAgentSessionProviderChildIdentity & {
   /** No input or authoritative options until host open settles. */
+  instructionAccount?: string
+  instructionRecoveryRefused?: true
   phase: StructuredAgentSessionProviderChildPhase
   /** Immutable, memory-only opening send ID; distinguishes its restart from another start. */
   readonly startedFor?: string

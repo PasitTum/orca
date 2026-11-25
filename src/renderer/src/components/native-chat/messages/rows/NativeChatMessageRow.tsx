@@ -38,6 +38,8 @@ import {
 /** Unconfirmed sending status or a failed-delivery notice with an optional dismissal. */
 export type NativeChatDeliveryNotice =
   | {
+      recoveryCardId?: never
+      recoveryFocus?: never
       sending: true
       text?: never
       onDismiss?: never
@@ -48,8 +50,10 @@ export type NativeChatDeliveryNotice =
       signIn?: never
     }
   | {
+      recoveryCardId?: string
       sending?: never
       text: string
+      recoveryFocus?: boolean
       detail?: string
       failureKind?: string
       /** A not-signed-in rejection, for the line's Sign in. */

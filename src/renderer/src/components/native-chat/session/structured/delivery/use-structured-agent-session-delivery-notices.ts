@@ -1,3 +1,4 @@
+import { useLatestHandler } from '@/lib/use-latest-handler'
 import { useEffect, useMemo, useRef } from 'react'
 import type {
   AgentJournalRenderItem,
@@ -6,6 +7,7 @@ import type {
 import { dispatchWasWithdrawn } from '../../../../../../../shared/agent-session/requests/structured-agent-session-dispatch-rejection'
 import { structuredAgentSessionCommandItemIds } from '../../../../../../../shared/agent-session/view/structured-agent-session-message-projection'
 import { structuredAgentSessionDeliveryNotices } from './structured-agent-session-delivery-notices'
+import { agentJournalSubmissionKey } from '../../../../../../../shared/agent-session/journal/agent-session-journal-item-key'
 import type { StructuredAgentSessionPendingSend } from './structured-agent-session-pending-sends'
 import { useStructuredAgentSessionStartFailureFacts } from '../../../messages/notices/use-structured-agent-session-start-failure-facts'
 import type { NativeChatDeliveryNotice } from '../../../messages/rows/NativeChatMessageRow'
@@ -18,18 +20,62 @@ export function useStructuredAgentSessionDeliveryNotices(args: {
   journalItems: readonly AgentJournalRenderItem[]
   agentName: string
   startFailures?: readonly AgentSessionFailureFact[]
+  onRetry?: (submission: AgentJournalSubmission, bodyClientMessageId: string) => void
 }): ReadonlyMap<string, NativeChatDeliveryNotice> {
   const { agentName, pending, submissions } = args
+  const onRetry = useLatestHandler(
+    (submission: AgentJournalSubmission, bodyClientMessageId: string) =>
+      args.onRetry?.(submission, bodyClientMessageId)
+  )
+  const retryEnabled = args.onRetry !== undefined
   // Only rejection wording needs journal items; pending delivery comes from submissions alone.
-  const hasRejected = submissions.some(
-    (submission) => submission.dispatchState === 'rejected' && !dispatchWasWithdrawn(submission)
+  const hasRejected = useMemo(
+    () =>
+      submissions.some(
+        (submission) => submission.dispatchState === 'rejected' && !dispatchWasWithdrawn(submission)
+      ),
+    [submissions]
   )
   const loadedFailures = useStructuredAgentSessionStartFailureFacts(
     args.journalItems,
     hasRejected && args.startFailures === undefined
   )
   const startFailures = args.startFailures ?? loadedFailures
-  const commandItemIds = useCommandItemIds(args.journalItems, hasRejected)
+  const commandItemIds = useStableItemIds(
+    useMemo(
+      () => (hasRejected ? structuredAgentSessionCommandItemIds(args.journalItems) : NO_ITEMS),
+      [hasRejected, args.journalItems]
+    )
+  )
+  const retryOriginals = useMemo(() => {
+    let ids: Set<string> | undefined
+    for (const submission of submissions) {
+      if (
+        submission.retryOfClientMessageId &&
+        (submission.dispatchState === 'pending' || submission.dispatchState === 'rejected')
+      ) {
+        if (!ids) {
+          ids = new Set()
+        }
+        ids.add(agentJournalSubmissionKey(submission.retryOfClientMessageId))
+      }
+    }
+    return ids ?? NO_ITEMS
+  }, [submissions])
+  const itemIds = useStableItemIds(
+    useMemo(() => {
+      if (retryOriginals.size === 0) {
+        return NO_ITEMS
+      }
+      const found = new Set<string>()
+      for (const item of args.journalItems) {
+        if (retryOriginals.has(item.itemId)) {
+          found.add(item.itemId)
+        }
+      }
+      return found
+    }, [args.journalItems, retryOriginals])
+  )
   const notices = useMemo(
     () =>
       structuredAgentSessionDeliveryNotices({
@@ -37,9 +83,11 @@ export function useStructuredAgentSessionDeliveryNotices(args: {
         submissions,
         agentName,
         startFailures,
-        commandItemIds
+        commandItemIds,
+        itemIds,
+        onRetry: retryEnabled ? onRetry : undefined
       }),
-    [pending, submissions, agentName, startFailures, commandItemIds]
+    [pending, submissions, agentName, startFailures, commandItemIds, itemIds, retryEnabled, onRetry]
   )
   // Reuse unchanged notices/maps across submission batches to avoid rerendering rows.
   const previousRef = useRef(notices)
@@ -50,17 +98,10 @@ export function useStructuredAgentSessionDeliveryNotices(args: {
   return stable
 }
 
-const NO_COMMANDS: ReadonlySet<string> = new Set()
+const NO_ITEMS: ReadonlySet<string> = new Set()
 
-/** Read command IDs only while enabled; retain unchanged sets through streaming. */
-function useCommandItemIds(
-  items: readonly AgentJournalRenderItem[],
-  enabled: boolean
-): ReadonlySet<string> {
-  const ids = useMemo(
-    () => (enabled ? structuredAgentSessionCommandItemIds(items) : NO_COMMANDS),
-    [enabled, items]
-  )
+/** Item-only streaming commits need no new notices when relevant membership is unchanged. */
+function useStableItemIds(ids: ReadonlySet<string>): ReadonlySet<string> {
   const previousRef = useRef(ids)
   const previous = previousRef.current
   const stable =
@@ -89,6 +130,9 @@ function sameNoticesKept(
       before.failureKind === notice.failureKind &&
       before.signIn?.agentName === notice.signIn?.agentName &&
       before.signIn?.account === notice.signIn?.account &&
+      (before.onSend === undefined) === (notice.onSend === undefined) &&
+      before.recoveryFocus === notice.recoveryFocus &&
+      before.recoveryCardId === notice.recoveryCardId &&
       (before.onDismiss === undefined) === (notice.onDismiss === undefined)
     allKept &&= same
     kept.set(id, same ? before : notice)
