@@ -3,6 +3,11 @@ import { targetBotChatLatest } from '@/lib/agent-session/open/bot-link-item-targ
 import { botTarget, callBotRpc, type BotOnHost } from '@/lib/bot-hosts'
 import { activateAndRevealFolderWorkspaceWithOutcome } from '@/lib/workspace/activation/worktree-activation'
 import { showChatOpenUnavailable } from '@/lib/agent-session/open/chat-open-failure-toast'
+import { desktopSelectionKey } from '@/lib/agent-session/open/paired-revealed-tab-wait'
+import {
+  isLatestDesktopOpenRequest,
+  noteDesktopOpenRequest
+} from '@/lib/agent-session/open/wait-for-structured-session-tab'
 import { runtimeTargetEnvironmentId } from '@/runtime/rpc/targets/runtime-client-target'
 import { LOCAL_EXECUTION_HOST_ID } from '../../../../shared/execution-host/execution-host'
 import { selectFocusedChatTab } from '@/lib/focused-chat-workers'
@@ -27,20 +32,29 @@ function admitHome(bot: BotHome): ReturnType<typeof activateAndRevealFolderWorks
 
 /** A server bot's chat tabs reach this window only through its home's workspace stream, so the
  *  home opens here first, as a Slack link's does. This computer's bots publish their tabs directly.
- *  `notified`: the refusal already told the user why (a blocked folder path). */
-async function admitServerBotHome(bot: BotHome): Promise<'opened' | 'refused' | 'notified'> {
+ *  `notified`: the refusal already told the user why (a blocked folder path). `stale`: the user
+ *  opened something else while the home's folder list loaded, so the window stays where they put it. */
+async function admitServerBotHome(
+  bot: BotHome,
+  sessionId: string
+): Promise<'opened' | 'refused' | 'notified' | 'stale'> {
   if (bot.hostId === LOCAL_EXECUTION_HOST_ID) {
     return 'opened'
   }
   let outcome = admitHome(bot)
   if ('refused' in outcome && outcome.refused.reason === 'workspace-missing') {
     // The home must be in the catalog before it can open; a failed read leaves it refused.
+    const request = noteDesktopOpenRequest(`bot-home\0${bot.hostId}\0${sessionId}`)
+    const shown = desktopSelectionKey()
     try {
       await useAppStore
         .getState()
         .fetchFolderWorkspaces({ runtimeEnvironmentId: runtimeTargetEnvironmentId(botTarget(bot)) })
     } catch {
       /* Reported below as a home that did not open, with Retry. */
+    }
+    if (!isLatestDesktopOpenRequest(request) || desktopSelectionKey() !== shown) {
+      return 'stale'
     }
     outcome = admitHome(bot)
   }
@@ -51,7 +65,7 @@ async function admitServerBotHome(bot: BotHome): Promise<'opened' | 'refused' | 
  *  steps for this same chat, so a home that failed to load gets another try and nothing starts anew. */
 export async function openBotChatTab(bot: BotHome, sessionId: string): Promise<boolean> {
   const retry = (): Promise<boolean> => openBotChatTab(bot, sessionId)
-  const home = await admitServerBotHome(bot)
+  const home = await admitServerBotHome(bot, sessionId)
   if (home !== 'opened') {
     if (home === 'refused') {
       showChatOpenUnavailable({

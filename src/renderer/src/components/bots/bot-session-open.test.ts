@@ -5,7 +5,8 @@ const mocks = vi.hoisted(() => ({
   fetchFolderWorkspaces: vi.fn(),
   activate: vi.fn(),
   unavailable: vi.fn(),
-  callBotRpc: vi.fn()
+  callBotRpc: vi.fn(),
+  shown: { key: 'workspace-x|tab-1' }
 }))
 
 vi.mock('@/lib/workspace/activation/worktree-activation', () => ({
@@ -17,6 +18,13 @@ vi.mock('@/lib/agent-session/open/activate-ai-vault-structured-session', () => (
 vi.mock('@/lib/agent-session/open/chat-open-failure-toast', () => ({
   showChatOpenUnavailable: mocks.unavailable
 }))
+vi.mock('@/lib/agent-session/open/paired-revealed-tab-wait', () => ({
+  desktopSelectionKey: () => mocks.shown.key
+}))
+vi.mock(
+  '@/lib/agent-session/open/wait-for-structured-session-tab',
+  () => import('../../lib/agent-session/open/wait-for-structured-session-tab')
+)
 vi.mock('@/lib/agent-session/open/bot-link-item-target', () => ({ targetBotChatLatest: vi.fn() }))
 vi.mock('@/lib/focused-chat-workers', () => ({ selectFocusedChatTab: vi.fn() }))
 vi.mock('@/components/native-chat/composer/focus/native-chat-composer-focus-intent', () => ({
@@ -38,6 +46,7 @@ vi.mock('@/store', () => ({
 }))
 
 import { openBotChatTab } from './bot-session-open'
+import { noteDesktopOpenRequest } from '../../lib/agent-session/open/wait-for-structured-session-tab'
 
 const opened = { opened: {} }
 const missing = { refused: { reason: 'workspace-missing', failureNotified: false } }
@@ -48,6 +57,7 @@ const serverBot = { folderWorkspaceId: 'home-1', hostId: 'runtime:env-1' } as co
 describe('openBotChatTab', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.shown.key = 'workspace-x|tab-1'
     mocks.activate.mockResolvedValue(true)
   })
 
@@ -115,5 +125,29 @@ describe('openBotChatTab', () => {
     await openBotChatTab(localBot, 'chat-1')
     expect(mocks.admit).not.toHaveBeenCalled()
     expect(mocks.activate).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves the window alone when another open starts while the Home list loads', async () => {
+    mocks.admit.mockReturnValue(missing)
+    mocks.fetchFolderWorkspaces.mockImplementationOnce(async () => {
+      noteDesktopOpenRequest('open another chat')
+      mocks.admit.mockReturnValue(opened)
+    })
+    await expect(openBotChatTab(serverBot, 'chat-1')).resolves.toBe(false)
+    // Only the first, refused admission ran: the late list never switches to this Home.
+    expect(mocks.admit).toHaveBeenCalledTimes(1)
+    expect(mocks.activate).not.toHaveBeenCalled()
+    expect(mocks.unavailable).not.toHaveBeenCalled()
+  })
+
+  it('leaves the window alone when the user selects something else while the Home list loads', async () => {
+    mocks.admit.mockReturnValue(missing)
+    mocks.fetchFolderWorkspaces.mockImplementationOnce(async () => {
+      mocks.shown.key = 'workspace-y|tab-2'
+      mocks.admit.mockReturnValue(opened)
+    })
+    await expect(openBotChatTab(serverBot, 'chat-1')).resolves.toBe(false)
+    expect(mocks.admit).toHaveBeenCalledTimes(1)
+    expect(mocks.activate).not.toHaveBeenCalled()
   })
 })

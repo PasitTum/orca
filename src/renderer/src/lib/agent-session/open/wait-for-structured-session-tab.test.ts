@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { openStructuredAgentSession } from '../../../../../shared/agent-session/view/open-structured-agent-session'
 import {
   createPairedRevealedTabWait,
+  noteDesktopOpenRequest,
   waitForStructuredSessionTab
 } from './wait-for-structured-session-tab'
 
@@ -56,14 +57,16 @@ describe('waitForStructuredSessionTab', () => {
 describe('createPairedRevealedTabWait through the shared open', () => {
   const target = { sessionId: 'chat-a', worktreeId: 'folder:bot-home' }
   type Tab = { id: string; sessionId: string }
+  type Selection = { key: string; front: string | null }
 
   /** A paired server whose revealed tab for chat A streams in only when `deliverA` runs. */
-  function pairedOpen(selection: { key: string; front: string | null }) {
+  function pairedOpen(selection: Selection) {
     const changes = store()
     let tabs: Tab[] = []
     const activated: string[] = []
     const guard = createPairedRevealedTabWait({
       paired: true,
+      request: noteDesktopOpenRequest('open chat-a'),
       hasTab: (t) => tabs.some((row) => row.sessionId === t.sessionId),
       selection: (t) => ({ key: selection.key, showsTarget: selection.front === t.sessionId }),
       subscribe: changes.subscribe,
@@ -97,7 +100,13 @@ describe('createPairedRevealedTabWait through the shared open', () => {
       tabs = [{ id: 'agent-session:chat-a', sessionId: 'chat-a' }]
       changes.emit()
     }
-    return { result, waitStarted, deliverA, activated }
+    /** The user's selection changes, as any store write would announce it. */
+    const select = (next: Selection): void => {
+      selection.key = next.key
+      selection.front = next.front
+      changes.emit()
+    }
+    return { result, waitStarted, deliverA, select, activated }
   }
 
   it('opens chat A when nothing else was selected while it waited', async () => {
@@ -109,33 +118,44 @@ describe('createPairedRevealedTabWait through the shared open', () => {
   })
 
   it('leaves a chat B the user selected during the wait in front', async () => {
-    const selection: { key: string; front: string | null } = {
-      key: 'workspace-a|tab-1',
-      front: 'tab-1'
-    }
+    const selection: Selection = { key: 'workspace-a|tab-1', front: 'tab-1' }
     const open = pairedOpen(selection)
     await open.waitStarted
-    // The user opens mirrored chat B while A's tab is still on its way.
-    selection.key = 'workspace-b|chat-b'
-    selection.front = 'chat-b'
+    open.select({ key: 'workspace-b|chat-b', front: 'chat-b' })
     open.deliverA()
     await expect(open.result).resolves.toEqual({ kind: 'superseded' })
     expect(open.activated).toEqual([])
     expect(selection.front).toBe('chat-b')
   })
 
-  it('yields to a newer desktop open even before the selection changes', async () => {
+  it('stays superseded when the selection moves away and comes back before A arrives', async () => {
     const open = pairedOpen({ key: 'workspace-a|tab-1', front: 'tab-1' })
     await open.waitStarted
-    createPairedRevealedTabWait({
-      paired: true,
-      hasTab: () => true,
-      selection: () => ({ key: '', showsTarget: false }),
-      subscribe: () => () => {},
-      timeoutMs: 5_000
-    })
+    open.select({ key: 'workspace-b|chat-b', front: 'chat-b' })
+    open.select({ key: 'workspace-a|tab-1', front: 'tab-1' })
     open.deliverA()
     await expect(open.result).resolves.toEqual({ kind: 'superseded' })
     expect(open.activated).toEqual([])
+  })
+
+  it('yields to a newer open even before the selection changes', async () => {
+    const open = pairedOpen({ key: 'workspace-a|tab-1', front: 'tab-1' })
+    await open.waitStarted
+    noteDesktopOpenRequest('open chat-b')
+    open.deliverA()
+    await expect(open.result).resolves.toEqual({ kind: 'superseded' })
+    expect(open.activated).toEqual([])
+  })
+
+  it('opens chat A when it is asked for again after a newer open', async () => {
+    const open = pairedOpen({ key: 'workspace-a|tab-1', front: 'tab-1' })
+    await open.waitStarted
+    noteDesktopOpenRequest('open chat-b')
+    // Chat B is in front now; the user asks for chat A again, joining its pending open.
+    open.select({ key: 'workspace-b|chat-b', front: 'chat-b' })
+    noteDesktopOpenRequest('open chat-a')
+    open.deliverA()
+    await expect(open.result).resolves.toMatchObject({ kind: 'opened' })
+    expect(open.activated).toEqual(['chat-a'])
   })
 })
