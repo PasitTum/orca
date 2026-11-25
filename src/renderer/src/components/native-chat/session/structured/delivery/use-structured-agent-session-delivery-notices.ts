@@ -12,6 +12,7 @@ import type { StructuredAgentSessionPendingSend } from './structured-agent-sessi
 import { useStructuredAgentSessionStartFailureFacts } from '../../../messages/notices/use-structured-agent-session-start-failure-facts'
 import type { NativeChatDeliveryNotice } from '../../../messages/rows/NativeChatMessageRow'
 import type { AgentSessionFailureFact } from '../../../../../../../shared/agent-session/failures/agent-session-failure'
+import { structuredAgentSessionRetryLineages } from '../../../../../../../shared/agent-session/view/structured-agent-session-retry-lineage'
 
 /** The structured chat's delivery notices, by the message id each row renders under. */
 export function useStructuredAgentSessionDeliveryNotices(args: {
@@ -28,13 +29,18 @@ export function useStructuredAgentSessionDeliveryNotices(args: {
       args.onRetry?.(submission, bodyClientMessageId)
   )
   const retryEnabled = args.onRetry !== undefined
+  const lineages = useMemo(() => structuredAgentSessionRetryLineages(submissions), [submissions])
   // Only rejection wording needs journal items; pending delivery comes from submissions alone.
   const hasRejected = useMemo(
     () =>
       submissions.some(
-        (submission) => submission.dispatchState === 'rejected' && !dispatchWasWithdrawn(submission)
+        (submission) =>
+          submission.dispatchState === 'rejected' &&
+          !dispatchWasWithdrawn(submission) &&
+          lineages.get(submission.retryOfClientMessageId ?? submission.clientMessageId)
+            ?.dispatchState !== 'accepted'
       ),
-    [submissions]
+    [lineages, submissions]
   )
   const loadedFailures = useStructuredAgentSessionStartFailureFacts(
     args.journalItems,
@@ -49,19 +55,16 @@ export function useStructuredAgentSessionDeliveryNotices(args: {
   )
   const retryOriginals = useMemo(() => {
     let ids: Set<string> | undefined
-    for (const submission of submissions) {
-      if (
-        submission.retryOfClientMessageId &&
-        (submission.dispatchState === 'pending' || submission.dispatchState === 'rejected')
-      ) {
+    for (const [root, retry] of lineages) {
+      if (retry.dispatchState === 'pending' || retry.dispatchState === 'rejected') {
         if (!ids) {
           ids = new Set()
         }
-        ids.add(agentJournalSubmissionKey(submission.retryOfClientMessageId))
+        ids.add(agentJournalSubmissionKey(root))
       }
     }
     return ids ?? NO_ITEMS
-  }, [submissions])
+  }, [lineages])
   const itemIds = useStableItemIds(
     useMemo(() => {
       if (retryOriginals.size === 0) {
